@@ -1,0 +1,34 @@
+[package]
+name = "wx_downloader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = "0.6"
+
+# HTTP: blocking client using the OS TLS stack (Schannel on Windows).
+# Blocking I/O runs on a dedicated thread and reports progress over a channel.
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+# serde_json decodes the GitHub API; serde derives the on-disk version cache.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Cross-thread progress reporting and one-shot results.
+async-channel = "2"
+
+[build-dependencies]
+# Rasterizes assets/logo.svg into a true-colour PNG at build time (see build.rs).
+resvg = { version = "0.45", default-features = false }
+
+# Shrink the shipped binary. GPUI pulls in a large dependency tree, so the
+# release profile is tuned for size; `lto` and `codegen-units = 1` also let the
+# linker drop code the app never reaches.
+[profile.release]
+strip = true          # drop symbols and debug info
+lto = true            # cross-crate dead-code elimination
+codegen-units = 1     # one unit, so LTO can inline and prune harder
+opt-level = "s"       # favour size over peak speed
+# Safe here: the only panic is window creation at startup, and the one
+# non-test `catch_unwind` in the GPUI stack (`with_text_selection_scope`)
+# re-raises immediately, so nothing recovers by unwinding.
+panic = "abort"
