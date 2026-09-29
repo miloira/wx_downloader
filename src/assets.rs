@@ -7,7 +7,9 @@
 //!   in the full Lucide catalog but not in that bundle, so referencing them
 //!   renders nothing. Just those two are embedded and used as a fallback.
 //! * **The logo.** Rendered from `assets/logo.svg` at build time (see
-//!   `build.rs`) and served as `logo.png`.
+//!   `build.rs`) and served as `logo.png` for the title bar. The same SVG also
+//!   produces the executable's shell icon (`.ico`), linked in as a Windows
+//!   resource rather than served as an asset.
 
 use std::borrow::Cow;
 

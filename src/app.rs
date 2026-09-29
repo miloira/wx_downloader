@@ -3,21 +3,27 @@
 use std::path::{Path, PathBuf};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::SelectableText;
 use gpui_kit::component::searchable_list::{SearchableGroup, SearchableVec};
 use gpui_kit::component::{
     ActiveTheme, Disableable, TitleBar,
     button::{Button, ButtonVariants},
     progress::Progress,
     select::{Select, SelectEvent, SelectState},
+    tooltip::Tooltip,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, AsyncApp, Context, Entity, FontWeight, Hsla, IntoElement,
-    ParentElement, PathPromptOptions, Render, SharedString, Styled, WeakEntity, Window, div, img,
-    px,
+    AnyElement, App, AppContext as _, AsyncApp, Context, ElementId, Entity, FocusHandle, FontWeight,
+    Hsla, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, ParentElement,
+    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, img, px,
 };
 
 use crate::download::{self, CancelFlag, DownloadEvent};
 use crate::versions::{self, VersionInfo, latest_tag};
+
+/// The project's repository, shown in the footer and opened by its button.
+const PROJECT_URL: &str = "https://github.com/miloira/wxhook";
 
 /// Where the download currently stands.
 enum Transfer {
@@ -55,6 +61,14 @@ pub struct WxApp {
     load_state: LoadState,
     transfer: Transfer,
     save_dir: PathBuf,
+    /// Keyboard focus for the whole view.
+    ///
+    /// `Root` binds `Ctrl+C` to the copy action under its own `"Root"` key
+    /// context. With nothing focused, a key event dispatches only to the root
+    /// node, whose path does not carry that context, so the binding never
+    /// matches and copying a selection silently does nothing. Holding focus on
+    /// this view keeps `"Root"` (an ancestor) on the dispatch path.
+    focus: FocusHandle,
 }
 
 impl WxApp {
@@ -92,7 +106,27 @@ impl WxApp {
             load_state: LoadState::Loading,
             transfer: Transfer::Idle,
             save_dir: default_save_dir(),
+            focus: cx.focus_handle(),
         };
+        // Focus the view so key events reach `Root`'s `Ctrl+C` binding from the
+        // start; the interactive controls below (the version picker, buttons)
+        // take focus when the user uses them, and root is an ancestor of all of
+        // them, so copy keeps working either way.
+        window.focus(&this.focus, cx);
+
+        // Moving or resizing the window is driven by a native modal loop that
+        // swallows the mouse-up, so a text-selection gesture started by that
+        // same press is never ended. It then lies dormant until the next click,
+        // which paints a stray selection from where the drag began to the
+        // pointer. The title bar suppresses the selection outright, but the
+        // resize band belongs to `Root`'s own window border, which we cannot
+        // reach — so clear any window selection whenever the bounds change,
+        // which covers both moving and resizing.
+        cx.observe_window_bounds(window, |_, window, cx| {
+            gpui_kit::base::TextSelection::clear(window, cx);
+        })
+        .detach();
+
         this.load_versions(window, cx, false);
         this
     }
@@ -252,26 +286,42 @@ impl WxApp {
     /// right. Owns dragging and double-click-to-maximize.
     fn title_bar(&self, cx: &App) -> AnyElement {
         let theme = cx.theme();
-        TitleBar::new()
-            .bg(theme.background)
+        // The `TitleBar` handles press-to-drag itself but does not stop the
+        // window-level text selection from also starting on the same press.
+        // Dragging then moves the window through a native modal loop, so the
+        // mouse-up never reaches GPUI and that selection gesture is left
+        // dangling — the next click elsewhere paints a selection from the title
+        // bar to the pointer. Suppress selection on the whole bar instead, the
+        // way the component library's own controls do.
+        div()
+            .id("title-bar-guard")
+            .w_full()
+            .flex_shrink(0.)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                gpui_kit::base::GlobalState::suppress_text_selection(cx);
+            })
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        // The logo is a true-colour PNG generated from
-                        // assets/logo.svg at build time. It must be drawn as an
-                        // image: GPUI's SVG renderer would flatten it into a
-                        // single-colour silhouette.
-                        img(crate::assets::LOGO_PATH).size(px(20.)),
-                    )
+                TitleBar::new()
+                    .bg(theme.background)
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child("微信安装包下载器"),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                // The logo is a true-colour PNG generated from
+                                // assets/logo.svg at build time. It must be drawn
+                                // as an image: GPUI's SVG renderer would flatten
+                                // it into a single-colour silhouette.
+                                img(crate::assets::LOGO_PATH).size(px(20.)),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child("微信安装包下载器"),
+                            ),
                     ),
             )
             .into_any_element()
@@ -315,7 +365,7 @@ impl WxApp {
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme.foreground)
-                            .child("微信版本号"),
+                            .child(copyable("version-heading", "微信版本号")),
                     )
                     .child(refresh_button),
             )
@@ -329,7 +379,12 @@ impl WxApp {
                     .search_placeholder("搜索版本号…")
                     .disabled(running),
             )
-            .child(div().text_xs().text_color(status_color).child(status_text))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(status_color)
+                    .child(copyable("status", status_text)),
+            )
             .into_any_element()
     }
 
@@ -339,7 +394,7 @@ impl WxApp {
             return div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("未选择版本")
+                .child(copyable("no-selection", "未选择版本"))
                 .into_any_element();
         };
 
@@ -440,8 +495,8 @@ impl WxApp {
                             .justify_between()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(format!("正在下载 v{version}"))
-                            .child(detail),
+                            .child(copyable("progress-version", format!("正在下载 v{version}")))
+                            .child(copyable("progress-detail", detail)),
                     )
                     .child(
                         Progress::new("download-progress")
@@ -454,17 +509,20 @@ impl WxApp {
             Transfer::Done { path } => div()
                 .text_sm()
                 .text_color(theme.success)
-                .child(format!("下载完成：{}", path.display()))
+                .child(copyable(
+                    "done-path",
+                    format!("下载完成：{}", path.display()),
+                ))
                 .into_any_element(),
             Transfer::Failed { error } => div()
                 .text_sm()
                 .text_color(theme.danger)
-                .child(format!("下载失败：{error}"))
+                .child(copyable("failed", format!("下载失败：{error}")))
                 .into_any_element(),
             Transfer::Cancelled => div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("已取消下载")
+                .child(copyable("cancelled", "已取消下载"))
                 .into_any_element(),
         }
     }
@@ -505,17 +563,38 @@ impl WxApp {
             );
         }
 
+        let full_path = format!("保存到：{}", self.save_dir.display());
+
         row.child(div().flex_1())
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
+                    .min_w_0()
                     .child(
+                        // Long paths ellipsize; hovering reveals the full path
+                        // in a tooltip, so nothing is lost to truncation.
                         div()
+                            .id("save-path")
+                            .min_w_0()
+                            .max_w(px(360.))
+                            .truncate()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(format!("保存到：{}", self.save_dir.display())),
+                            .tooltip({
+                                let full_path = full_path.clone();
+                                move |window, cx| {
+                                    // Bounded so a very long path wraps inside
+                                    // the popup instead of running off screen.
+                                    let path = full_path.clone();
+                                    Tooltip::element(move |_, _| {
+                                        div().max_w(px(520.)).child(path.clone())
+                                    })
+                                    .build(window, cx)
+                                }
+                            })
+                            .child(copyable("save-path-text", full_path.clone())),
                     )
                     .child(
                         Button::new("pick-dir")
@@ -528,15 +607,56 @@ impl WxApp {
             )
             .into_any_element()
     }
+
+    /// The footer: the project link, selectable so it can be copied.
+    fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(copyable("project-link-label", "项目地址："))
+            .child(
+                div()
+                    .id("project-link-text")
+                    .min_w_0()
+                    .truncate()
+                    .tooltip({
+                        move |window, cx| {
+                            Tooltip::element(|_, _| div().max_w(px(520.)).child(PROJECT_URL))
+                                .build(window, cx)
+                        }
+                    })
+                    .child(copyable("project-link", PROJECT_URL)),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for WxApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         div()
+            .id("wx-app-root")
             .size_full()
             .flex()
             .flex_col()
+            // Track a focus handle so key events (the `Ctrl+C` copy binding)
+            // dispatch through `Root`'s context even when no control is focused.
+            .track_focus(&self.focus)
+            // Repaint while the pointer drags. A text-selection drag is not an
+            // OS drag, so GPUI does not refresh the window on pointer movement
+            // by itself; without this the selection only appears on the *next*
+            // unrelated repaint (so it looked like nothing was highlighted until
+            // release, or at all). Refreshing here makes the highlight follow
+            // the pointer live.
+            .on_mouse_move(cx.listener(|_, event: &MouseMoveEvent, window, _| {
+                if event.pressed_button.is_some() {
+                    window.refresh();
+                }
+            }))
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(self.title_bar(cx))
@@ -547,11 +667,24 @@ impl Render for WxApp {
                     .flex_1()
                     .gap_5()
                     .p_6()
+                    // Tighter bottom edge: the footer's own spacing is 10px, so
+                    // the link sits 10px above the window edge too.
+                    .pb(px(10.))
                     .child(self.version_picker(cx))
                     .child(self.details(cx))
                     .child(self.progress_area(cx))
                     .child(div().flex_1())
-                    .child(self.controls(cx)),
+                    // Controls and the footer sit together as one bottom group,
+                    // with a tighter gap than the sections above, so the link
+                    // hugs the control row instead of floating on its own line.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(self.controls(cx))
+                            .child(self.footer(cx)),
+                    ),
             )
     }
 }
@@ -562,7 +695,7 @@ fn version_row(info: &VersionInfo, value_color: Hsla, key_color: Hsla) -> AnyEle
         div()
             .text_sm()
             .text_color(value_color)
-            .child(SharedString::from(format!("v{}", info.version))),
+            .child(copyable("detail-version", format!("v{}", info.version))),
     );
     if info.latest {
         value = value.child(latest_tag());
@@ -594,9 +727,19 @@ fn detail_row(key: &'static str, value: String, value_color: Hsla, key_color: Hs
             div()
                 .text_sm()
                 .text_color(value_color)
-                .child(SharedString::from(value)),
+                .child(copyable(key, value)),
         )
         .into_any_element()
+}
+
+/// Text the user can drag-select and copy with Ctrl+C.
+///
+/// `Root` already paints the window-scoped selection layer and installs the
+/// copy handler, so a plain [`SelectableText`] is all a call site needs. It
+/// inherits the text style from the styled `div` it is placed in, so callers
+/// keep styling the wrapper as before.
+fn copyable(id: impl Into<ElementId>, text: impl Into<SharedString>) -> SelectableText {
+    SelectableText::new(id, text)
 }
 
 /// `%USERPROFILE%\Downloads` when it exists, otherwise the current directory.
@@ -674,5 +817,224 @@ mod tests {
         assert_eq!(second.file_name().unwrap(), "weixin_4.1.15.13 (1).exe");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Drag-select + Ctrl+C, driven through GPUI's headless test harness.
+///
+/// Synthetic OS input on Windows is timing-flaky (the clipboard write races the
+/// selection registration), so the copy path is pinned down here instead: the
+/// harness dispatches the same pointer and keystroke events a real window does,
+/// deterministically.
+#[cfg(test)]
+mod selection_tests {
+    use gpui_kit::base::TextSelection;
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext as _, Modifiers, MouseButton, Render, TestAppContext, Window, div, px};
+
+    use super::*;
+
+    /// Hosts a single detail row — the same element the details card renders —
+    /// under a `Root`, which supplies the selection layer and the copy binding.
+    struct Host {
+        focus: gpui_kit::FocusHandle,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus).p_4().child(detail_row(
+                "文件名",
+                "weixin_4.1.15.13.exe".to_string(),
+                gpui_kit::black(),
+                gpui_kit::black(),
+            ))
+        }
+    }
+
+    /// Builds the host under a `Root` and focuses it.
+    fn harness(cx: &mut TestAppContext) -> &mut gpui_kit::VisualTestContext {
+        cx.update(gpui_kit::init);
+        let host = cx.update(|cx| {
+            cx.new(|cx| Host {
+                focus: cx.focus_handle(),
+            })
+        });
+        let handle = cx.update(|cx| host.read(cx).focus.clone());
+        let (_, cx) = cx.add_window_view(move |window, cx| Root::new(host, window, cx));
+        cx.update(|window, cx| {
+            window.focus(&handle, cx);
+            let _ = window.draw(cx);
+        });
+        cx
+    }
+
+    /// A horizontal drag across the value paints a selection and Ctrl+C copies
+    /// exactly the dragged-over text.
+    #[gpui_kit::test]
+    fn dragging_selects_and_ctrl_c_copies(cx: &mut TestAppContext) {
+        let cx = harness(cx);
+
+        // The host pads by 16px; the key column is 72px plus a 12px gap, so the
+        // value's text starts around x=104 and the row sits at y≈28.
+        let start = gpui::point(px(104.), px(28.));
+        let end = gpui::point(px(300.), px(28.));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+
+        // The highlight is not just painted — it is the live window selection.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert_eq!(
+                TextSelection::selected_text(window, cx),
+                "weixin_4.1.15.13.exe"
+            );
+        });
+
+        cx.simulate_keystrokes("ctrl-c");
+
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("Ctrl+C should have written the selection to the clipboard");
+        assert_eq!(copied, "weixin_4.1.15.13.exe");
+    }
+
+    /// Clicking without dragging must not copy anything: the interaction is
+    /// select-then-copy, not click-to-copy.
+    #[gpui_kit::test]
+    fn a_plain_click_does_not_copy(cx: &mut TestAppContext) {
+        let cx = harness(cx);
+
+        cx.simulate_click(gpui::point(px(120.), px(28.)), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_keystrokes("ctrl-c");
+
+        assert!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+                .is_empty(),
+            "a click alone must not put anything on the clipboard"
+        );
+    }
+
+    // MARK: title-bar press must not start a selection
+
+    /// A title-bar strip over a selectable row. `guarded` mirrors the real
+    /// title bar's suppression of the window text selection on press.
+    struct BarHost {
+        focus: gpui_kit::FocusHandle,
+        guarded: bool,
+    }
+
+    fn bar(guarded: bool) -> AnyElement {
+        // Owning the press is the point; the guard is what suppresses the
+        // window selection that would otherwise also start on this press.
+        let element = div().id("bar").w_full().h(px(24.));
+        if guarded {
+            element
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    gpui_kit::base::GlobalState::suppress_text_selection(cx);
+                })
+                .into_any_element()
+        } else {
+            element
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .into_any_element()
+        }
+    }
+
+    impl Render for BarHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .track_focus(&self.focus)
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(bar(self.guarded))
+                .child(div().p_4().child(detail_row(
+                    "文件名",
+                    "weixin_4.1.15.13.exe".to_string(),
+                    gpui_kit::black(),
+                    gpui_kit::black(),
+                )))
+        }
+    }
+
+    fn bar_harness(cx: &mut TestAppContext, guarded: bool) -> &mut gpui_kit::VisualTestContext {
+        cx.update(gpui_kit::init);
+        let host = cx.update(|cx| {
+            cx.new(|cx| BarHost {
+                focus: cx.focus_handle(),
+                guarded,
+            })
+        });
+        let handle = cx.update(|cx| host.read(cx).focus.clone());
+        let (_, cx) = cx.add_window_view(move |window, cx| Root::new(host, window, cx));
+        cx.update(|window, cx| {
+            window.focus(&handle, cx);
+            let _ = window.draw(cx);
+        });
+        cx
+    }
+
+    /// Pressing the title bar and dragging off it (which is how the window is
+    /// moved) must not start or extend a text selection. Without the guard the
+    /// gesture is left dangling — the window move swallows the mouse-up — and
+    /// the next interaction paints a selection from the bar to the pointer.
+    #[gpui_kit::test]
+    fn pressing_the_title_bar_does_not_start_a_selection(cx: &mut TestAppContext) {
+        let cx = bar_harness(cx, true);
+
+        // Press on the 24px-tall bar, then drag down onto the value text.
+        cx.simulate_mouse_down(
+            gpui::point(px(50.), px(12.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(px(160.), px(50.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert_eq!(
+                TextSelection::selected_text(window, cx),
+                "",
+                "a press-drag that starts on the title bar must not select text"
+            );
+        });
+    }
+
+    /// The counterpart that documents the failure: the very same drag *does*
+    /// select when the bar does not suppress selection, so the guard above is
+    /// what makes the difference.
+    #[gpui_kit::test]
+    fn without_a_guard_the_same_drag_selects_text(cx: &mut TestAppContext) {
+        let cx = bar_harness(cx, false);
+
+        cx.simulate_mouse_down(
+            gpui::point(px(50.), px(12.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(px(160.), px(50.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(
+                !TextSelection::selected_text(window, cx).is_empty(),
+                "without the guard the drag should select text (this is the bug)"
+            );
+        });
     }
 }

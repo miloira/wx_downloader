@@ -20,6 +20,12 @@ async-channel = "2"
 # Rasterizes assets/logo.svg into a true-colour PNG at build time (see build.rs).
 resvg = { version = "0.45", default-features = false }
 
+[dev-dependencies]
+# The test-support feature gives headless windows and simulated pointer/keyboard
+# input, which is the only way to exercise the drag-select + Ctrl+C copy path
+# deterministically (synthetic OS input on Windows is timing-flaky).
+gpui-kit = { version = "0.6", features = ["test-support"] }
+
 # Shrink the shipped binary. GPUI pulls in a large dependency tree, so the
 # release profile is tuned for size; `lto` and `codegen-units = 1` also let the
 # linker drop code the app never reaches.

@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Stray AppData written when the app is launched with USERPROFILE pointing into
+# the repo (used to test custom save paths); not part of the project.
+/AppData/
